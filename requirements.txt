@@ -3,4 +3,5 @@ rank-bm25>=0.2.2
 sentence-transformers>=2.6.0
 pymupdf>=1.23.0
 groq>=0.9.0
-python-dotenv>=1.0.0
+python-dotenv>=1.0.0nltk>=3.8.0
+nltk>=3.8.0
