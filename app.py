@@ -1,4 +1,5 @@
 import os
+import json
 import streamlit as st
 from dotenv import load_dotenv
 from ingestion import process_file
@@ -6,6 +7,9 @@ from retrieval import build_index, search
 from reranker import rerank
 from llm import stream_answer
 from utils import format_context, truncate_context
+from eval.retrieval_eval import run_retrieval_eval, TEST_SET
+from eval.answer_eval import run_answer_eval
+from eval.ragas_eval import run_ragas_eval
 
 load_dotenv()
 
@@ -84,6 +88,12 @@ if "chunks" not in st.session_state:
     st.session_state.chunks = []
 if "bm25_index" not in st.session_state:
     st.session_state.bm25_index = None
+if "retrieval_eval_result" not in st.session_state:
+    st.session_state.retrieval_eval_result = None
+if "answer_eval_result" not in st.session_state:
+    st.session_state.answer_eval_result = None
+if "ragas_eval_result" not in st.session_state:
+    st.session_state.ragas_eval_result = None
 
 with st.sidebar:
     st.markdown("<h2 style='font-size:1.1rem; font-weight:700; color:#1a1a1a; margin-bottom:0;'>Vectorless RAG</h2>", unsafe_allow_html=True)
@@ -138,6 +148,133 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+    st.divider()
+    st.markdown("<p style='font-size:0.72rem; color:#64748b; text-transform:uppercase; letter-spacing:0.8px; font-weight:600;'>Mode</p>", unsafe_allow_html=True)
+    app_mode = st.radio("Mode", ["Chat", "Evaluate"], label_visibility="collapsed")
+
+# ── Evaluate mode ──
+if app_mode == "Evaluate":
+    st.markdown("<h2 style='font-size:1.3rem; font-weight:700;'>Evaluation</h2>", unsafe_allow_html=True)
+    has_data = "chunks" in st.session_state and st.session_state.chunks
+
+    eval_tab1, eval_tab2, eval_tab3 = st.tabs(["Retrieval eval", "Answer eval", "RAGAS"])
+
+    # ── TAB 1: Retrieval eval ──
+    with eval_tab1:
+        st.info("**Recall@k** measures the fraction of relevant documents found in the top-k results. "
+                "**Precision@k** measures how many of the top-k results are actually relevant.")
+
+        if not has_data:
+            st.warning("Upload and index a document first to run retrieval evaluation.")
+        else:
+            if st.button("Run retrieval eval", key="run_retrieval"):
+                with st.spinner("Running retrieval evaluation..."):
+                    st.session_state.retrieval_eval_result = run_retrieval_eval(
+                        st.session_state.chunks, st.session_state.bm25_index
+                    )
+
+            if st.session_state.retrieval_eval_result:
+                res = st.session_state.retrieval_eval_result
+                col1, col2 = st.columns(2)
+                col1.metric("Avg Recall@5", f"{res['avg_recall']:.3f}")
+                col2.metric("Avg Precision@5", f"{res['avg_precision']:.3f}")
+
+                import pandas as pd
+                df = pd.DataFrame(res["per_query"])
+                df.columns = ["Query", "Recall@5", "Precision@5"]
+                st.dataframe(df, use_container_width=True)
+
+        st.markdown("**Current TEST_SET** (edit `eval/retrieval_eval.py` to add real chunk IDs):")
+        st.code(json.dumps(TEST_SET, indent=2), language="json")
+
+    # ── TAB 2: Answer eval ──
+    with eval_tab2:
+        st.info("**Faithfulness** measures whether the answer is supported by the provided context. "
+                "**Relevancy** measures how well the answer addresses the question.")
+
+        placeholder_json = json.dumps([{
+            "question": "What is the main topic?",
+            "answer": "The document discusses...",
+            "context": "The main topic of this paper is..."
+        }], indent=2)
+
+        qa_input = st.text_area(
+            "Paste QA pairs as JSON array",
+            value=placeholder_json,
+            height=200,
+            key="answer_eval_input",
+        )
+
+        if st.button("Run answer eval", key="run_answer"):
+            if not api_key:
+                st.error("Groq API key is required for answer evaluation.")
+            else:
+                try:
+                    qa_pairs = json.loads(qa_input)
+                    with st.spinner("Running answer evaluation (LLM-based scoring)..."):
+                        st.session_state.answer_eval_result = run_answer_eval(qa_pairs, api_key)
+                except json.JSONDecodeError:
+                    st.error("Malformed JSON. Please provide a valid JSON array.")
+                except Exception as e:
+                    st.error(f"Evaluation failed: {e}")
+
+        if st.session_state.answer_eval_result:
+            res = st.session_state.answer_eval_result
+            col1, col2 = st.columns(2)
+            col1.metric("Avg Faithfulness", f"{res['avg_faithfulness']:.3f}")
+            col2.metric("Avg Relevancy", f"{res['avg_relevancy']:.3f}")
+
+            import pandas as pd
+            df = pd.DataFrame(res["per_question"])
+            df.columns = ["Question", "Faithfulness", "Relevancy"]
+            st.dataframe(df, use_container_width=True)
+
+    # ── TAB 3: RAGAS ──
+    with eval_tab3:
+        st.info("**RAGAS** (Retrieval Augmented Generation Assessment) evaluates your RAG pipeline with 4 metrics: "
+                "faithfulness, answer_relevancy, context_recall, and context_precision. "
+                "Requires the `ragas` and `datasets` packages.")
+        st.code("pip install ragas datasets", language="bash")
+
+        ragas_placeholder = json.dumps([{
+            "question": "What is the main topic?",
+            "answer": "The document discusses...",
+            "contexts": ["The main topic of this paper is..."],
+            "ground_truth": "The main topic is machine learning."
+        }], indent=2)
+
+        ragas_input = st.text_area(
+            "Paste QA pairs as JSON array (with ground_truth)",
+            value=ragas_placeholder,
+            height=220,
+            key="ragas_eval_input",
+        )
+
+        if st.button("Run RAGAS eval", key="run_ragas"):
+            try:
+                qa_pairs = json.loads(ragas_input)
+                with st.spinner("Running RAGAS evaluation..."):
+                    st.session_state.ragas_eval_result = run_ragas_eval(qa_pairs)
+            except json.JSONDecodeError:
+                st.error("Malformed JSON. Please provide a valid JSON array.")
+            except Exception as e:
+                st.error(f"Evaluation failed: {e}")
+
+        if st.session_state.ragas_eval_result:
+            res = st.session_state.ragas_eval_result
+            if "error" in res:
+                st.error(res["error"])
+            else:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Faithfulness", f"{res.get('faithfulness', 0):.3f}")
+                col2.metric("Answer Relevancy", f"{res.get('answer_relevancy', 0):.3f}")
+                col3.metric("Context Recall", f"{res.get('context_recall', 0):.3f}")
+                col4.metric("Context Precision", f"{res.get('context_precision', 0):.3f}")
+                st.balloons()
+
+    st.stop()
+
+# ── Chat mode ──
 if not st.session_state.messages and st.session_state.bm25_index is None:
     st.components.v1.html("""
 <!DOCTYPE html>
